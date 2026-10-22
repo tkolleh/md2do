@@ -45,6 +45,16 @@ describe('Todoist push and sync edit only the owned token', () => {
     );
   });
 
+  it('hands the transforms to the writer directly, so it can pass them the protected spans', () => {
+    const mapLines = calls.flatMap((c) => c.match(/mapLine:[^,\n]*/g) ?? []);
+    expect(mapLines).toHaveLength(2);
+    for (const mapLine of mapLines) {
+      expect(mapLine).toMatch(
+        /mapLine:\s*(addSourceIfUnchanged|removeSourceIfPresent)\(/,
+      );
+    }
+  });
+
   it('keeps the completion pull as a plain checkbox update', () => {
     const completion = calls.filter((c) => /completed:/.test(c));
     expect(completion).toHaveLength(1);

@@ -2,8 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { addTask, updateTask, updateTasks } from '../../src/writer/index.js';
-import { withSource, withoutSource } from '../../src/parser/index.js';
+import {
+  addTask,
+  updateTask,
+  updateTasks,
+  type UpdateTaskOptions,
+} from '../../src/writer/index.js';
+import {
+  addSourceIfUnchanged,
+  removeSourceIfPresent,
+  withSource,
+  withoutSource,
+} from '../../src/parser/index.js';
 
 const TOKEN = ' {todoist:999}';
 const CHECKBOX = /^\s*-\s+\[[ xX]\]\s/;
@@ -440,6 +450,258 @@ describe('mapLine (R4)', () => {
     expect(result.success).toBe(false);
     expect(result.errors[0]?.error).toMatch(/mapLine/);
     expect(await read()).toBe('- [ ] a');
+  });
+});
+
+describe('mapLine and protected spans (R5)', () => {
+  const link = (
+    line: number,
+    mapLine: NonNullable<UpdateTaskOptions['updates']['mapLine']>,
+  ) => updateTask({ file, line, updates: { mapLine } });
+  const lineOf = (content: string, n: number) =>
+    content.split('\n')[n - 1] ?? '';
+
+  it('hands the transform the exact line and the spans of links and wiki-links on it', async () => {
+    await write('- [ ] a\n- [ ] [x](u) [[w]]\n');
+    const seen: unknown[] = [];
+    await updateTask({
+      file,
+      line: 2,
+      updates: {
+        mapLine: (l, spans) => {
+          seen.push(l, spans);
+          return l;
+        },
+      },
+    });
+    expect(seen).toEqual([
+      '- [ ] [x](u) [[w]]',
+      [
+        [6, 12],
+        [13, 18],
+      ],
+    ]);
+  });
+
+  it('hands an empty list when the line has no links', async () => {
+    await write('- [ ] plain !!');
+    const seen: unknown[] = [];
+    await updateTask({
+      file,
+      line: 1,
+      updates: {
+        mapLine: (l, spans) => {
+          seen.push(spans);
+          return l;
+        },
+      },
+    });
+    expect(seen).toEqual([[]]);
+  });
+
+  it('computes spans on a CRLF line past earlier CRLF lines, with the carriage return last', async () => {
+    await write('- [ ] a\r\n- [ ] b\r\n- [ ] [x](u/{todoist:5})\r\n');
+    const seen: unknown[] = [];
+    await updateTask({
+      file,
+      line: 3,
+      updates: {
+        mapLine: (l, spans) => {
+          seen.push(l, spans);
+          return l;
+        },
+      },
+    });
+    expect(seen).toEqual(['- [ ] [x](u/{todoist:5})\r', [[6, 24]]]);
+  });
+
+  it('still accepts a transform that ignores the spans', async () => {
+    await write('- [ ] [x](u) a');
+    const result = await link(1, (l) => withSource(l, 'todoist', '9'));
+    expect(result.success).toBe(true);
+    expect(await read()).toBe('- [ ] [x](u) a {todoist:9}');
+  });
+
+  it.each([
+    ['link destination', '- [ ] see [x](u/{todoist:5}) end\n'],
+    ['image', '- [ ] see ![x](u/{todoist:5}) end\n'],
+    ['wiki-link', '- [ ] see [[a{todoist:5}]] end\n'],
+    ['embed', '- [ ] see ![[a{todoist:5}]] end\n'],
+    ['reference link', '- [ ] see [x{todoist:5}][r] end\n\n[r]: u\n'],
+  ])(
+    'links a task whose %s holds a token, appending the real one',
+    async (_n, content) => {
+      await write(content);
+      const first = lineOf(content, 1);
+      const result = await link(1, addSourceIfUnchanged(first, 'todoist', '9'));
+      expect(result.success).toBe(true);
+      expect(await read()).toBe(content.replace(first, `${first} {todoist:9}`));
+    },
+  );
+
+  it('links on a CRLF line past earlier CRLF lines', async () => {
+    const content = '- [ ] a\r\n- [ ] [x](u/{todoist:5})\r\n';
+    await write(content);
+    const result = await link(
+      2,
+      addSourceIfUnchanged('- [ ] [x](u/{todoist:5})\r', 'todoist', '9'),
+    );
+    expect(result.success).toBe(true);
+    expect(await read()).toBe(
+      '- [ ] a\r\n- [ ] [x](u/{todoist:5}) {todoist:9}\r\n',
+    );
+  });
+
+  it('spans stay valid after the completion toggle', async () => {
+    await write('- [ ] [x](u/{todoist:5})');
+    const result = await updateTask({
+      file,
+      line: 1,
+      updates: {
+        completed: true,
+        mapLine: addSourceIfUnchanged(
+          '- [x] [x](u/{todoist:5})',
+          'todoist',
+          '9',
+        ),
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(await read()).toBe('- [x] [x](u/{todoist:5}) {todoist:9}');
+  });
+
+  it('unlinks the real token and leaves the one inside the link', async () => {
+    await write('- [ ] [x](u/{todoist:5}) {todoist:5}\n');
+    const result = await link(1, removeSourceIfPresent('todoist', '5'));
+    expect(result.success).toBe(true);
+    expect(await read()).toBe('- [ ] [x](u/{todoist:5})\n');
+  });
+
+  it('refuses to unlink when only the link holds the id, leaving the file untouched', async () => {
+    const content = '- [ ] [x](u/{todoist:5})\n';
+    await write(content);
+    const result = await link(1, removeSourceIfPresent('todoist', '5'));
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/changed since it was scanned/);
+    expect(await read()).toBe(content);
+  });
+
+  it.each([
+    [
+      'removes a token inside a link',
+      '- [ ] [x](u/{todoist:5})',
+      (l: string) => l.replace('{todoist:5}', ''),
+    ],
+    [
+      'inserts a token inside a link',
+      '- [ ] [x](u/)',
+      (l: string) => l.replace('u/', 'u/{todoist:5}'),
+    ],
+    [
+      'inserts a token inside a wiki-link',
+      '- [ ] [[a]]',
+      (l: string) => l.replace('a]]', 'a{todoist:5}]]'),
+    ],
+    [
+      'removes a token inside an embed',
+      '- [ ] ![[a{todoist:5}]]',
+      (l: string) => l.replace('{todoist:5}', ''),
+    ],
+  ])(
+    'rejects a transform that %s, leaving the file untouched',
+    async (_n, content, fn) => {
+      await write(content);
+      const result = await link(1, fn);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/owned token/);
+      expect(await read()).toBe(content);
+    },
+  );
+
+  it('in a batch, recomputes spans after an earlier edit to the same line', async () => {
+    // Removing the long real token shifts the link left by more than its own length,
+    // so spans taken from the original file would no longer cover the token inside it
+    const long = '{todoist:123456789012345678901234567890}';
+    const content = `- [ ] ${long} [x](u/{todoist:5})\n`;
+    await write(content);
+    const result = await updateTasks(file, [
+      {
+        line: 1,
+        updates: {
+          mapLine: removeSourceIfPresent(
+            'todoist',
+            '123456789012345678901234567890',
+          ),
+        },
+      },
+      { line: 1, updates: { mapLine: removeSourceIfPresent('todoist', '5') } },
+    ]);
+    expect(result.updatedCount).toBe(1);
+    expect(result.errors.map((e) => e.line)).toEqual([1]);
+    // The space right after the checkbox stays when the token after it is removed
+    expect(await read()).toBe('- [ ]  [x](u/{todoist:5})\n');
+  });
+});
+
+describe('span-aware link and unlink (seeded)', () => {
+  const rng = (seed: number) => () => {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  // Protected tokens reuse the id that gets linked, so ignoring spans fails fast
+  const FRAGMENTS = [
+    '[x](u/{todoist:999})',
+    '[[a{todoist:999}]]',
+    '![[b{todoist:999}]]',
+    '![i](p/{todoist:999})',
+    '[s](a.md#x)',
+    '[[abcd#h|T]]',
+    '!!',
+    '@tj',
+    '#tag',
+    '{teams:m-1}',
+    '🚀',
+    'plain',
+  ];
+
+  it.each([31, 32, 33])('seed %i', async (seed) => {
+    const next = rng(seed);
+    const pick = <T>(xs: readonly T[]): T =>
+      xs[Math.floor(next() * xs.length)] as T;
+    const eol = pick(['\n', '\r\n']);
+    const content =
+      Array.from(
+        { length: 10 },
+        () =>
+          `${pick(['- [ ] ', '- [x] ', '  - [ ] '])}${Array.from(
+            { length: 1 + Math.floor(next() * 4) },
+            () => pick(FRAGMENTS),
+          ).join(' ')}${pick(['', ' ', '  '])}`,
+      ).join(eol) + eol;
+
+    for (const line of taskLines(content.replace(/\r\n/g, '\n'))) {
+      const text = content.split('\n')[line - 1] ?? '';
+      const ctx = `seed ${seed} line ${line}: ${JSON.stringify(text)}`;
+      await write(content);
+      const linked = await updateTask({
+        file,
+        line,
+        updates: { mapLine: addSourceIfUnchanged(text, 'todoist', '999') },
+      });
+      expect(linked.success, ctx).toBe(true);
+      expect(changedLines(content, await read()), ctx).toEqual([line]);
+
+      const unlinked = await updateTask({
+        file,
+        line,
+        updates: { mapLine: removeSourceIfPresent('todoist', '999') },
+      });
+      expect(unlinked.success, ctx).toBe(true);
+      expect(await read(), ctx).toBe(content);
+    }
   });
 });
 

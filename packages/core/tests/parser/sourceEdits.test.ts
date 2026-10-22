@@ -1,10 +1,25 @@
 import { describe, it, expect } from 'vitest';
 import {
   addSourceIfUnchanged,
+  isOwnedTokenEdit,
   removeSourceIfPresent,
   withoutSource,
   withSource,
 } from '../../src/parser/index.js';
+import {
+  analyzeStructure,
+  protectedSpansFor,
+} from '../../src/scanner/structure.js';
+
+/** Protected spans of one line, as the scanner and the writer compute them */
+const spansOf = (content: string, lineNumber = 1) => {
+  const lines = content.split('\n');
+  return protectedSpansFor(
+    analyzeStructure(content, lines),
+    lineNumber,
+    lines[lineNumber - 1] ?? '',
+  );
+};
 
 const LOSSY =
   '- [ ] Review [[abcd#h|Design Doc]] and [spec](a/b.md#x) !! @tj #writing #due/2026-11-01';
@@ -241,6 +256,188 @@ describe('withSource/withoutSource round trip (seeded)', () => {
         expect(
           withoutSource(added, 'todoist'),
           `seed ${seed} iteration ${i}: ${JSON.stringify(line)}`,
+        ).toBe(line);
+      }
+    },
+  );
+});
+
+describe('tokens inside links, wiki-links and embeds are not owned', () => {
+  // [content, the same line with its protected token only]
+  const PROTECTED: ReadonlyArray<readonly [string, string]> = [
+    ['link destination', '- [ ] see [x](u/{todoist:5}) end'],
+    ['link title', '- [ ] see [x](u "[todoist:5]") end'],
+    ['image', '- [ ] see ![x](u/{todoist:5}) end'],
+    ['wiki-link', '- [ ] see [[a{todoist:5}]] end'],
+    ['embed', '- [ ] see ![[a{todoist:5}]] end'],
+    ['reference link', '- [ ] see [x{todoist:5}][r] end\n\n[r]: u'],
+  ];
+
+  describe.each(PROTECTED)('in a %s', (_name, content) => {
+    const line = content.split('\n')[0] ?? '';
+    const spans = spansOf(content);
+    // Reference links only parse with their definition, which sits after the task line
+    const withReal = (token: string) =>
+      `${line} ${token}${content.slice(line.length)}`;
+
+    it('guards the fixture: the scanner protects a span around the token', () => {
+      expect(spans.length).toBeGreaterThan(0);
+    });
+
+    it('withSource ignores it for the presence check and still appends', () => {
+      expect(withSource(line, 'todoist', '9', spans)).toBe(
+        `${line} {todoist:9}`,
+      );
+    });
+
+    it('withSource without spans keeps today’s behaviour', () => {
+      expect(withSource(line, 'todoist', '9')).toBe(line);
+    });
+
+    it('withoutSource leaves it alone', () => {
+      expect(withoutSource(line, 'todoist', undefined, spans)).toBe(line);
+    });
+
+    it('withoutSource removes the real token after it, not the protected one', () => {
+      const real = withReal('{todoist:5}');
+      expect(
+        withoutSource(real.split('\n')[0] ?? '', 'todoist', '5', spansOf(real)),
+      ).toBe(line);
+    });
+
+    it('removeSourceIfPresent refuses when only the protected token carries the id', () => {
+      expect(() => removeSourceIfPresent('todoist', '5')(line, spans)).toThrow(
+        /changed since it was scanned/,
+      );
+    });
+
+    it('removeSourceIfPresent removes the real token', () => {
+      const real = withReal('{todoist:5}');
+      expect(
+        removeSourceIfPresent('todoist', '5')(
+          real.split('\n')[0] ?? '',
+          spansOf(real),
+        ),
+      ).toBe(line);
+    });
+
+    it('addSourceIfUnchanged appends past it', () => {
+      expect(addSourceIfUnchanged(line, 'todoist', '9')(line, spans)).toBe(
+        `${line} {todoist:9}`,
+      );
+    });
+
+    it('the guard rejects removing it, and accepts it only without spans', () => {
+      const after = line.replace(/ ?(\{todoist:5\}|\[todoist:5\])/, '');
+      expect(after).not.toBe(line);
+      expect(isOwnedTokenEdit(line, after, spans)).toBe(false);
+      expect(isOwnedTokenEdit(line, after)).toBe(true);
+    });
+  });
+
+  it('removes a legacy bracket token in a title only when it is outside', () => {
+    const line = '- [ ] see [x](u "[todoist:5]") [todoist:5]';
+    expect(withoutSource(line, 'todoist', '5', spansOf(line))).toBe(
+      '- [ ] see [x](u "[todoist:5]")',
+    );
+  });
+
+  it('treats a token that touches a span edge as outside it', () => {
+    const line = '- [ ] [x](u){todoist:5}';
+    expect(withoutSource(line, 'todoist', '5', spansOf(line))).toBe(
+      '- [ ] [x](u)',
+    );
+    const before = '- [ ] a{todoist:5}[x](u)';
+    expect(withoutSource(before, 'todoist', '5', spansOf(before))).toBe(
+      '- [ ] a[x](u)',
+    );
+  });
+
+  describe('isOwnedTokenEdit with spans', () => {
+    const before = '- [ ] [x](u/) end';
+    const spans = spansOf(before);
+
+    it('rejects inserting a token inside a span', () => {
+      const after = '- [ ] [x](u/{todoist:5}) end';
+      expect(isOwnedTokenEdit(before, after, spans)).toBe(false);
+      expect(isOwnedTokenEdit(before, after)).toBe(true);
+    });
+
+    it('rejects inserting a token with its separating space inside a span', () => {
+      const after = '- [ ] [x](u/ {todoist:5}) end';
+      expect(isOwnedTokenEdit(before, after, spans)).toBe(false);
+    });
+
+    it('accepts inserting right after a span', () => {
+      expect(
+        isOwnedTokenEdit(before, '- [ ] [x](u/) {todoist:5} end', spans),
+      ).toBe(true);
+    });
+
+    it('accepts inserting right before a span', () => {
+      const tight = '- [ ] a[x](u)';
+      expect(
+        isOwnedTokenEdit(tight, '- [ ] a{todoist:5}[x](u)', spansOf(tight)),
+      ).toBe(true);
+    });
+
+    it('accepts removing a real token while a protected one is present', () => {
+      const both = '- [ ] [x](u/{todoist:5}) {todoist:5}';
+      expect(
+        isOwnedTokenEdit(both, '- [ ] [x](u/{todoist:5})', spansOf(both)),
+      ).toBe(true);
+    });
+
+    it('still rejects any other change', () => {
+      expect(isOwnedTokenEdit(before, `${before}x`, spans)).toBe(false);
+    });
+  });
+});
+
+describe('span-aware round trip (seeded)', () => {
+  const rng = (seed: number) => () => {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  // Protected tokens reuse the id that gets linked, so ignoring spans fails fast
+  const FRAGMENTS = [
+    '[x](u/{todoist:999})',
+    '[[a{todoist:999}]]',
+    '![[b{todoist:999}]]',
+    '![i](p/{todoist:999})',
+    '[s](a.md#x)',
+    '[[abcd#h|T]]',
+    '!!',
+    '@tj',
+    '#tag',
+    '{teams:m-1}',
+    '🚀',
+    'plain',
+  ];
+  const TAILS = ['', ' ', '  ', '\r', ' \r'];
+
+  it.each([21, 22, 23, 24, 25])(
+    'seed %i: unlinking what was linked restores the line',
+    (seed) => {
+      const next = rng(seed);
+      const pick = <T>(xs: readonly T[]): T =>
+        xs[Math.floor(next() * xs.length)] as T;
+
+      for (let i = 0; i < 200; i++) {
+        const text = Array.from({ length: 1 + Math.floor(next() * 5) }, () =>
+          pick(FRAGMENTS),
+        ).join(' ');
+        const line = `${pick(['- [ ] ', '- [x] ', '  - [ ] '])}${text}${pick(TAILS)}`;
+        const ctx = `seed ${seed} iteration ${i}: ${JSON.stringify(line)}`;
+
+        const added = withSource(line, 'todoist', '999', spansOf(line));
+        expect(added, ctx).not.toBe(line);
+        expect(
+          withoutSource(added, 'todoist', '999', spansOf(added)),
+          ctx,
         ).toBe(line);
       }
     },
