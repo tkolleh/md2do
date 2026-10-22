@@ -117,13 +117,15 @@ export const DUE_DATE_SHORT = /\[due:\s*(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\]/i;
  *   "#urgent-fix" → "urgent-fix"
  *   "# heading" → no match (space after #)
  *   "#due/2026-01-25" → no match (due date, not a tag)
+ *   "#2920" → no match (numeric reference such as a PR or issue number)
+ *   "#2026-q1" → "2026-q1" (only a purely numeric name is excluded)
  *
  * Groups:
  *   [1] - Tag name (alphanumeric and hyphens only)
  *
  * Note: Use with .match() or .matchAll() to get all tags
  */
-export const TAG = /#(?!due\/)([\w-]+)/g;
+export const TAG = /#(?!due\/)(?!\d+(?![\w-]))([\w-]+)/g;
 
 /**
  * Matches Todoist ID in new syntax ({todoist:NNN}) or legacy bracket syntax
