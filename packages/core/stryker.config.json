@@ -9,15 +9,26 @@
     "src/scanner/index.ts:142-143",
     "src/scanner/index.ts:145-151",
     "src/scanner/index.ts:185-185",
-    "src/parser/index.ts:280-325",
-    "src/parser/index.ts:431-445",
-    "src/parser/index.ts:485-485",
-    "src/parser/patterns.ts:128-128"
+    "src/parser/index.ts:134-229",
+    "src/parser/index.ts:377-422",
+    "src/parser/index.ts:528-542",
+    "src/parser/index.ts:582-582",
+    "src/parser/patterns.ts:128-128",
+    "src/writer/index.ts:47-102",
+    "src/writer/index.ts:156-160",
+    "src/writer/index.ts:246-252",
+    "src/writer/index.ts:317-344"
   ],
   "coverageAnalysis": "perTest",
   "reporters": ["clear-text", "json"],
-  "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
-  "thresholds": { "high": 90, "low": 90, "break": 90 },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "thresholds": {
+    "high": 90,
+    "low": 90,
+    "break": 90
+  },
   "tempDirName": ".stryker-tmp",
   "cleanTempDir": "always"
 }
