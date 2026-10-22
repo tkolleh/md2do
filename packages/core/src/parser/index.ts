@@ -131,6 +131,103 @@ export function formatSources(sources: Record<string, string>): string {
     .join(' ');
 }
 
+const escapeRegExp = (s: string): string =>
+  s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// {slug:id}, plus the legacy [todoist:id] form; `id` narrows the match to one value
+const sourceToken = (slug: string, id?: string): RegExp => {
+  const value = id === undefined ? undefined : escapeRegExp(id);
+  const legacy =
+    slug === 'todoist' ? `|\\[todoist:\\s*${value ?? '\\d+'}\\]` : '';
+  return new RegExp(
+    `\\{${escapeRegExp(slug)}:${value ?? '[^}]+'}\\}${legacy}`,
+    'i',
+  );
+};
+
+// Every {slug:id} token the writer may add or remove, except the reserved {completed:...}
+const ANY_OWNED_TOKEN = new RegExp(
+  `${PATTERNS.BRACE_TOKEN_NON_RESERVED.source}|${PATTERNS.TODOIST_ID_LEGACY.source}`,
+  'gi',
+);
+
+/**
+ * Add a {slug:id} token to the end of a task line's content, leaving every
+ * other byte (including trailing whitespace and a carriage return) untouched.
+ * A line that already carries that slug is returned unchanged.
+ *
+ * @example
+ * withSource("- [ ] Task !! @tj", "todoist", "5") // => "- [ ] Task !! @tj {todoist:5}"
+ */
+export function withSource(line: string, slug: string, id: string): string {
+  if (sourceToken(slug).test(line)) return line;
+  const content = line.trimEnd();
+  return `${content} {${slug}:${id}}${line.slice(content.length)}`;
+}
+
+/**
+ * Remove the first {slug:id} token (and the legacy [todoist:id] form) from a
+ * task line, with the space that separated it. Everything else is untouched.
+ *
+ * @example
+ * withoutSource("- [ ] Task {todoist:5} !!", "todoist") // => "- [ ] Task !!"
+ */
+export function withoutSource(line: string, slug: string, id?: string): string {
+  // The space before the token goes with it, except the one right after the checkbox
+  return line.replace(
+    new RegExp(
+      `(?:(?<!^\\s*-\\s+\\[[ xX]\\]) )?(?:${sourceToken(slug, id).source})`,
+      'i',
+    ),
+    '',
+  );
+}
+
+/**
+ * True when `after` differs from `before` only by one owned source token
+ * added or removed (with the space that separated it).
+ */
+export function isOwnedTokenEdit(before: string, after: string): boolean {
+  const removesOne = (from: string, to: string): boolean =>
+    Array.from(from.matchAll(ANY_OWNED_TOKEN)).some((m) => {
+      const start = m.index;
+      const end = start + m[0].length;
+      return (
+        to === from.slice(0, start) + from.slice(end) ||
+        (from[start - 1] === ' ' &&
+          to === from.slice(0, start - 1) + from.slice(end))
+      );
+    });
+  return (
+    before === after || removesOne(before, after) || removesOne(after, before)
+  );
+}
+
+const LINE_CHANGED = 'Line changed since it was scanned';
+
+/**
+ * Line transform for the writer's `mapLine`: add a source token, but only if
+ * the line is still exactly what was scanned. Throws otherwise, so a note
+ * edited in the meantime is never modified at a stale line number.
+ */
+export const addSourceIfUnchanged =
+  (expectedLine: string, slug: string, id: string) =>
+  (current: string): string => {
+    if (current !== expectedLine) throw new Error(LINE_CHANGED);
+    return withSource(current, slug, id);
+  };
+
+/**
+ * Line transform for the writer's `mapLine`: remove one source token, but only
+ * if the line still carries it. Throws otherwise.
+ */
+export const removeSourceIfPresent =
+  (slug: string, id: string) =>
+  (current: string): string => {
+    if (!sourceToken(slug, id).test(current)) throw new Error(LINE_CHANGED);
+    return withoutSource(current, slug, id);
+  };
+
 /**
  * Extract completion date from task text
  *

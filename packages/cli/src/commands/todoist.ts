@@ -6,7 +6,12 @@ import {
   md2doToTodoist,
   todoistToMd2do,
 } from '@md2do/todoist';
-import { parseTask, updateTask, formatSources } from '@md2do/core';
+import {
+  parseTask,
+  updateTask,
+  addSourceIfUnchanged,
+  removeSourceIfPresent,
+} from '@md2do/core';
 import type { Task as TodoistTask } from '@doist/todoist-api-typescript';
 import type { Task } from '@md2do/core';
 import { scanMarkdownFiles } from '../scanner.js';
@@ -500,14 +505,13 @@ async function todoistImportAction(
   // Create task in Todoist
   const todoistTask = await client.createTask(todoistParams);
 
-  // Update markdown file with Todoist ID
-  // Merge any existing sources with the new todoist id
-  const updatedSources = { ...(task.sources ?? {}), todoist: todoistTask.id };
+  // Link the note to Todoist by appending the id token; every other byte of the
+  // line stays, and the write is refused if the line changed since it was read
   const updateResult = await updateTask({
     file: file,
     line,
     updates: {
-      text: `${task.text} ${formatSources(updatedSources)}`,
+      mapLine: addSourceIfUnchanged(lineContent, 'todoist', todoistTask.id),
     },
   });
 
@@ -736,18 +740,13 @@ async function todoistSyncAction(options: TodoistSyncOptions): Promise<void> {
           errorCount++;
         }
       } else if (update.type === 'pull' && !update.todoistTask) {
-        // Remove Todoist ID from deleted task — reconstruct sources without todoist
-        const remainingSources = { ...(update.task.sources ?? {}) };
-        delete remainingSources['todoist'];
-        const sourcesStr =
-          Object.keys(remainingSources).length > 0
-            ? ` ${formatSources(remainingSources)}`
-            : '';
+        // Task deleted in Todoist: remove only its id token from the line
+        const todoistId = update.task.sources?.['todoist'] ?? '';
         const result = await updateTask({
           file: update.task.file,
           line: update.task.line,
           updates: {
-            text: `${update.task.text}${sourcesStr}`,
+            mapLine: removeSourceIfPresent('todoist', todoistId),
           },
         });
 

@@ -1,6 +1,6 @@
 import * as fs from 'fs/promises';
 import { TASK_CHECKBOX } from '../parser/patterns.js';
-import { parseTask } from '../parser/index.js';
+import { isOwnedTokenEdit, parseTask } from '../parser/index.js';
 import type { Task } from '../types/index.js';
 
 export interface UpdateTaskOptions {
@@ -24,15 +24,81 @@ export interface UpdateTaskOptions {
     completed?: boolean;
 
     /**
-     * Update the task text
+     * Update the task text. Rewrites everything after the checkbox, so any
+     * metadata not in the new text is lost: only for explicit user rewrites.
      */
     text?: string;
 
     /**
-     * Replace the entire line
+     * Replace the entire line. Destructive, like `text`.
      */
     replaceLine?: string;
+
+    /**
+     * Transform the line (after any `completed` change). The result may differ
+     * from the input only by one owned {slug:id} token added or removed;
+     * anything else, or a thrown error, rejects the edit and writes nothing.
+     * Cannot be combined with `text` or `replaceLine`.
+     */
+    mapLine?: (line: string) => string;
   };
+}
+
+type LineUpdates = UpdateTaskOptions['updates'];
+
+// Stryker disable next-line Regex: only validated task lines reach here, and they start with the checkbox, so the ^ anchor is a redundant safeguard
+const CHECKBOX_MARK = /^(\s*-\s+\[)([ xX])(\])/;
+
+function setCompleted(line: string, completed: boolean): string {
+  return line.replace(
+    CHECKBOX_MARK,
+    (whole: string, open: string, mark: string, close: string) =>
+      (mark.toLowerCase() === 'x') === completed
+        ? whole
+        : `${open}${completed ? 'x' : ' '}${close}`,
+  );
+}
+
+function applyUpdates(
+  originalLine: string,
+  updates: LineUpdates,
+): { line: string } | { error: string } {
+  if (
+    updates.mapLine &&
+    (updates.text !== undefined || updates.replaceLine !== undefined)
+  ) {
+    return { error: 'mapLine cannot be combined with text or replaceLine' };
+  }
+
+  if (updates.replaceLine !== undefined) {
+    return { line: updates.replaceLine };
+  }
+
+  const toggled =
+    updates.completed === undefined
+      ? originalLine
+      : setCompleted(originalLine, updates.completed);
+
+  if (updates.mapLine) {
+    try {
+      const mapped = updates.mapLine(toggled);
+      return isOwnedTokenEdit(toggled, mapped)
+        ? { line: mapped }
+        : { error: 'mapLine may only add or remove an owned token' };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  if (updates.text !== undefined) {
+    // Replace task text while preserving checkbox
+    // Stryker disable all: callers validate the line with TASK_CHECKBOX first, so the prefix always exists
+    const prefix = TASK_CHECKBOX.exec(toggled)?.[0];
+    return { line: prefix === undefined ? toggled : prefix + updates.text };
+    // Stryker restore all
+  }
+
+  return { line: toggled };
 }
 
 export interface WriteTaskResult {
@@ -87,33 +153,11 @@ export async function updateTask(
     }
 
     // Apply updates
-    let updatedLine: string;
-
-    if (updates.replaceLine !== undefined) {
-      // Replace the entire line
-      updatedLine = updates.replaceLine;
-    } else {
-      // Apply individual updates
-      updatedLine = originalLine;
-
-      if (updates.completed !== undefined) {
-        // Update completion status
-        const isCurrentlyCompleted = /- \[x\]/i.test(updatedLine);
-        if (updates.completed && !isCurrentlyCompleted) {
-          updatedLine = updatedLine.replace(/- \[ \]/, '- [x]');
-        } else if (!updates.completed && isCurrentlyCompleted) {
-          updatedLine = updatedLine.replace(/- \[x\]/i, '- [ ]');
-        }
-      }
-
-      if (updates.text !== undefined) {
-        // Replace task text while preserving checkbox
-        const checkboxMatch = updatedLine.match(/^(\s*- \[[x ]\]\s*)/i);
-        if (checkboxMatch) {
-          updatedLine = checkboxMatch[1] + updates.text;
-        }
-      }
+    const applied = applyUpdates(originalLine, updates);
+    if ('error' in applied) {
+      return { success: false, error: applied.error };
     }
+    const updatedLine = applied.line;
 
     // Update the line in the array
     lines[lineIndex] = updatedLine;
@@ -199,29 +243,13 @@ export async function updateTasks(
       }
 
       // Apply updates
-      let updatedLine = originalLine;
-
-      if (taskUpdates.replaceLine !== undefined) {
-        updatedLine = taskUpdates.replaceLine;
-      } else {
-        if (taskUpdates.completed !== undefined) {
-          const isCurrentlyCompleted = /- \[x\]/i.test(updatedLine);
-          if (taskUpdates.completed && !isCurrentlyCompleted) {
-            updatedLine = updatedLine.replace(/- \[ \]/, '- [x]');
-          } else if (!taskUpdates.completed && isCurrentlyCompleted) {
-            updatedLine = updatedLine.replace(/- \[x\]/i, '- [ ]');
-          }
-        }
-
-        if (taskUpdates.text !== undefined) {
-          const checkboxMatch = updatedLine.match(/^(\s*- \[[x ]\]\s*)/i);
-          if (checkboxMatch) {
-            updatedLine = checkboxMatch[1] + taskUpdates.text;
-          }
-        }
+      const applied = applyUpdates(originalLine, taskUpdates);
+      if ('error' in applied) {
+        errors.push({ line: lineNumber, error: applied.error });
+        continue;
       }
 
-      lines[lineIndex] = updatedLine;
+      lines[lineIndex] = applied.line;
       updatedCount++;
     }
 
@@ -287,9 +315,11 @@ export async function addTask(
       }
     }
 
-    const lines = content.split('\n');
+    const lines = content === '' ? [] : content.split('\n');
+    const endsWithNewline = content.endsWith('\n');
 
     // Insert the task
+    let insertedLine: number;
     if (options.line !== undefined) {
       // Validate line number
       if (options.line < 1 || options.line > lines.length + 1) {
@@ -299,12 +329,18 @@ export async function addTask(
         };
       }
       lines.splice(options.line - 1, 0, taskLine);
+      insertedLine = options.line;
+    } else if (endsWithNewline) {
+      // Replace the empty tail so the file still ends with exactly one newline
+      insertedLine = lines.length;
+      lines.splice(lines.length - 1, 1, taskLine, '');
     } else {
-      // Append to end
-      if (content.length > 0 && !content.endsWith('\n')) {
+      // Append to end, after a blank line unless the file is empty
+      if (lines.length > 0) {
         lines.push('');
       }
       lines.push(taskLine);
+      insertedLine = lines.length;
     }
 
     // Write atomically
@@ -315,7 +351,6 @@ export async function addTask(
     await fs.rename(tempFile, file);
 
     // Parse the new task
-    const insertedLine = options.line ?? lines.length;
     const parseResult = parseTask(taskLine, insertedLine, file, {});
 
     const result: WriteTaskResult = {
