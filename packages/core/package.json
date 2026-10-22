@@ -54,6 +54,12 @@
     "date-fns": "^3.0.6"
   },
   "devDependencies": {
-    "tsup": "^8.0.1"
+    "@stryker-mutator/core": "^8.7.1",
+    "@stryker-mutator/vitest-runner": "^8.7.1",
+    "@types/mdast": "^4.0.4",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "tsup": "^8.0.1",
+    "unified": "^11.0.5"
   }
 }

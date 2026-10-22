@@ -27,6 +27,10 @@ export interface Task {
   // Optional external source links (slug → externalId)
   sources?: Record<string, string>;
   completedDate?: Date;
+
+  // Nesting: id of the enclosing task, and the raw indented lines beneath this task
+  parent?: string;
+  description?: string;
 }
 
 export interface ParsingContext {

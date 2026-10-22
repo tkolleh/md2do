@@ -275,6 +275,56 @@ export function cleanTaskText(text: string): string {
 }
 
 /**
+ * Half-open character range [start, end) within a line
+ */
+export type Span = readonly [start: number, end: number];
+
+// Private-use code points: never match \w, @, # or !, and survive whitespace cleanup
+const PLACEHOLDER_BASE = 0xe000;
+
+/**
+ * Replace protected spans (given as offsets into the whole line) with one
+ * placeholder character each, so metadata patterns cannot match inside them.
+ * `restore` puts the original text back after cleanup.
+ *
+ * @param text - Task text (the part of the line after the checkbox)
+ * @param spans - Protected ranges as offsets into the full line
+ * @param textOffset - Offset of `text` within the full line
+ */
+function maskSpans(
+  text: string,
+  spans: ReadonlyArray<Span>,
+  textOffset: number,
+): { masked: string; restore: (s: string) => string } {
+  const local = spans
+    .map(([start, end]) => [start - textOffset, end - textOffset] as const)
+    .filter(([start, end]) => start >= 0 && end > start && end <= text.length)
+    .sort((a, b) => a[0] - b[0]);
+
+  const originals = local.map(([start, end]) => text.slice(start, end));
+  const masked = local.reduceRight(
+    (acc, [start, end], i) =>
+      acc.slice(0, start) +
+      String.fromCharCode(PLACEHOLDER_BASE + i) +
+      acc.slice(end),
+    text,
+  );
+
+  return {
+    masked,
+    restore: (s) =>
+      originals.reduce(
+        (acc, original, i) =>
+          acc.replace(
+            String.fromCharCode(PLACEHOLDER_BASE + i),
+            () => original,
+          ),
+        s,
+      ),
+  };
+}
+
+/**
  * Parse a single line as a task
  *
  * This is the main parser entry point. It:
@@ -296,6 +346,7 @@ export function parseTask(
   lineNumber: number,
   file: string,
   context: ParsingContext,
+  protectedSpans: ReadonlyArray<Span> = [],
 ): { task: Task | null; warnings: Warning[] } {
   const warnings: Warning[] = [];
 
@@ -376,15 +427,22 @@ export function parseTask(
   // Extract text (everything after checkbox)
   const fullText = line.substring(taskMatch[0].length);
 
+  // Links, wiki-links and embeds are opaque: metadata is read from the text around them
+  const { masked, restore } = maskSpans(
+    fullText,
+    protectedSpans,
+    taskMatch[0].length,
+  );
+
   // Parse metadata from text
-  const assignee = extractAssignee(fullText);
-  const priority = extractPriority(fullText);
-  const tags = extractTags(fullText);
-  const sources = extractSources(fullText);
-  const completedDate = extractCompletedDate(fullText);
+  const assignee = extractAssignee(masked);
+  const priority = extractPriority(masked);
+  const tags = extractTags(masked);
+  const sources = extractSources(masked);
+  const completedDate = extractCompletedDate(masked);
 
   // Extract due date (may produce warning)
-  const dueDateResult = extractDueDate(fullText, context);
+  const dueDateResult = extractDueDate(masked, context);
   if (dueDateResult.warning) {
     warnings.push({
       ...dueDateResult.warning,
@@ -424,7 +482,7 @@ export function parseTask(
   }
 
   // Clean text (remove metadata markers)
-  const cleanText = cleanTaskText(fullText);
+  const cleanText = restore(cleanTaskText(masked));
 
   // Generate stable ID
   const id = generateTaskId(file, lineNumber, cleanText);

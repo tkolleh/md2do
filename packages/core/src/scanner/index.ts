@@ -1,5 +1,32 @@
 import type { Task, ParsingContext, Warning } from '../types/index.js';
 import { parseTask } from '../parser/index.js';
+import {
+  analyzeStructure,
+  childRange,
+  protectedSpansFor,
+} from './structure.js';
+
+/**
+ * Attach `description` (the indented lines beneath a task) and `parent`
+ * (the innermost earlier task whose children include this one).
+ */
+function withNesting(tasks: ReadonlyArray<Task>, lines: string[]): Task[] {
+  const ranges = tasks.map((task) => ({
+    task,
+    ...childRange(lines, task.line),
+  }));
+
+  return ranges.map(({ task, description }) => {
+    const parent = ranges
+      .filter((r) => r.task.line < task.line && task.line <= r.end)
+      .at(-1)?.task;
+    return {
+      ...task,
+      ...(description !== undefined && { description }),
+      ...(parent !== undefined && { parent: parent.id }),
+    };
+  });
+}
 
 /**
  * Extract project name from file path
@@ -104,6 +131,7 @@ export class MarkdownScanner {
 
     // Process file line by line
     const lines = content.split('\n');
+    const structure = analyzeStructure(content, lines);
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -111,8 +139,17 @@ export class MarkdownScanner {
 
       const lineNumber = i + 1; // 1-indexed
 
+      // Fenced code is example text, not the user's tasks
+      if (structure.fencedLines.has(lineNumber)) continue;
+
       // Try to parse as task
-      const result = parseTask(line, lineNumber, filePath, context);
+      const result = parseTask(
+        line,
+        lineNumber,
+        filePath,
+        context,
+        protectedSpansFor(structure, lineNumber, line),
+      );
 
       if (result.task) {
         tasks.push(result.task);
@@ -145,7 +182,7 @@ export class MarkdownScanner {
       }
     }
 
-    return { tasks, warnings };
+    return { tasks: withNesting(tasks, lines), warnings };
   }
 
   /**
