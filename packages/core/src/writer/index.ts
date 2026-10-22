@@ -1,6 +1,8 @@
 import * as fs from 'fs/promises';
 import { TASK_CHECKBOX } from '../parser/patterns.js';
 import { isOwnedTokenEdit, parseTask } from '../parser/index.js';
+import type { Span } from '../parser/index.js';
+import { analyzeStructure, protectedSpansFor } from '../scanner/structure.js';
 import type { Task } from '../types/index.js';
 
 export interface UpdateTaskOptions {
@@ -38,13 +40,29 @@ export interface UpdateTaskOptions {
      * Transform the line (after any `completed` change). The result may differ
      * from the input only by one owned {slug:id} token added or removed;
      * anything else, or a thrown error, rejects the edit and writes nothing.
+     * `protectedSpans` are the ranges of the line (links, images, wiki-links)
+     * that the scanner treats as opaque; tokens inside them are not owned and
+     * the edit is rejected if it adds or removes one.
      * Cannot be combined with `text` or `replaceLine`.
      */
-    mapLine?: (line: string) => string;
+    mapLine?: (line: string, protectedSpans: ReadonlyArray<Span>) => string;
   };
 }
 
 type LineUpdates = UpdateTaskOptions['updates'];
+
+// The same spans the scanner masks, so the writer and the scanner agree on what is a token.
+// Taken from the lines as they are now, so an earlier edit in a batch cannot leave them stale.
+const spansFor = (
+  lines: ReadonlyArray<string>,
+  lineNumber: number,
+): ReadonlyArray<Span> =>
+  protectedSpansFor(
+    analyzeStructure(lines.join('\n'), lines),
+    lineNumber,
+    // Stryker disable next-line StringLiteral: the target line was validated to exist, so the fallback only satisfies noUncheckedIndexedAccess
+    lines[lineNumber - 1] ?? '',
+  );
 
 // Stryker disable next-line Regex: only validated task lines reach here, and they start with the checkbox, so the ^ anchor is a redundant safeguard
 const CHECKBOX_MARK = /^(\s*-\s+\[)([ xX])(\])/;
@@ -62,6 +80,7 @@ function setCompleted(line: string, completed: boolean): string {
 function applyUpdates(
   originalLine: string,
   updates: LineUpdates,
+  protectedSpans: ReadonlyArray<Span>,
 ): { line: string } | { error: string } {
   if (
     updates.mapLine &&
@@ -81,8 +100,9 @@ function applyUpdates(
 
   if (updates.mapLine) {
     try {
-      const mapped = updates.mapLine(toggled);
-      return isOwnedTokenEdit(toggled, mapped)
+      // The toggle keeps the line length, so spans from the original line still apply
+      const mapped = updates.mapLine(toggled, protectedSpans);
+      return isOwnedTokenEdit(toggled, mapped, protectedSpans)
         ? { line: mapped }
         : { error: 'mapLine may only add or remove an owned token' };
     } catch (error) {
@@ -153,7 +173,11 @@ export async function updateTask(
     }
 
     // Apply updates
-    const applied = applyUpdates(originalLine, updates);
+    const applied = applyUpdates(
+      originalLine,
+      updates,
+      updates.mapLine ? spansFor(lines, line) : [],
+    );
     if ('error' in applied) {
       return { success: false, error: applied.error };
     }
@@ -243,7 +267,11 @@ export async function updateTasks(
       }
 
       // Apply updates
-      const applied = applyUpdates(originalLine, taskUpdates);
+      const applied = applyUpdates(
+        originalLine,
+        taskUpdates,
+        taskUpdates.mapLine ? spansFor(lines, lineNumber) : [],
+      );
       if ('error' in applied) {
         errors.push({ line: lineNumber, error: applied.error });
         continue;
